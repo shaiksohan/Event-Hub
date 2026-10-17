@@ -1,0 +1,11 @@
+[functions.payment-gateway]
+verify_jwt = true
+
+[functions.ai-assistant]
+verify_jwt = true
+
+[functions.reset-password]
+verify_jwt = false
+
+[functions.otp-auth]
+verify_jwt = false
