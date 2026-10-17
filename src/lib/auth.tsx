@@ -76,10 +76,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const { data: listener } = supabase.auth.onAuthStateChange((event, session) => {
       (async () => {
         if (event === 'PASSWORD_RECOVERY') {
-          setPasswordResetMode(true);
-          setLoading(false);
-          return;
-        }
+  setSession(session);
+  setUser(session?.user ?? null);
+  setPasswordResetMode(true);
+  setLoading(false);
+  return;
+}
         if (session?.user && sessionStorage.getItem('eh_google_reset') === '1') {
           sessionStorage.removeItem('eh_google_reset');
           setPasswordResetMode(true);
@@ -175,12 +177,37 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   };
 
   const updatePassword = async (newPassword: string) => {
-    const { error } = await supabase.auth.updateUser({ password: newPassword });
-    if (error) return { error: error.message };
-    setPasswordResetMode(false);
-    await supabase.auth.signOut();
-    return { error: null };
-  };
+  if (!passwordResetMode) {
+    return {
+      error: 'Please open the password recovery link from your email first.',
+    };
+  }
+
+  const {
+    data: { session: currentSession },
+    error: sessionError,
+  } = await supabase.auth.getSession();
+
+  if (sessionError || !currentSession?.user) {
+    return {
+      error: 'Your recovery session has expired. Please request a new link.',
+    };
+  }
+
+  const { error } = await supabase.auth.updateUser({
+    password: newPassword,
+  });
+
+  if (error) {
+    return { error: error.message };
+  }
+
+  setPasswordResetMode(false);
+
+  await supabase.auth.signOut();
+
+  return { error: null };
+};
 
   const clearPasswordResetMode = () => {
     setPasswordResetMode(false);

@@ -1,13 +1,18 @@
 /*
-# Enable realtime on reels table
-
-1. Changes
-- Adds the `reels` table to the Supabase Realtime publication so INSERT and DELETE events
-  are broadcast to all subscribed clients. This makes new reels appear in every user's
-  feed automatically without needing to refresh the page.
-
-2. Security
-- No RLS changes — existing policies still apply.
+  Enable Supabase Realtime for the reels table.
+  Add the table only if it is not already in the publication.
 */
 
-ALTER PUBLICATION supabase_realtime ADD TABLE reels;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_publication_tables
+    WHERE pubname = 'supabase_realtime'
+      AND schemaname = 'public'
+      AND tablename = 'reels'
+  ) THEN
+    ALTER PUBLICATION supabase_realtime ADD TABLE public.reels;
+  END IF;
+END
+$$;

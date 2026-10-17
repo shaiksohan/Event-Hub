@@ -1,163 +1,272 @@
 /*
-# Add Escrow Payment System
+  EventHub escrow foundation.
 
-1. Changes to service_bookings table
-- Add `escrow_status` column (text, default 'none') to track payment hold/release lifecycle
-  Values: 'none' (no escrow, e.g. cash), 'held' (payment deposited in app, held until completion), 'released' (payment released to provider after completion), 'refunded' (payment refunded to customer on cancellation)
-- Add `escrow_released_at` column (timestamptz, nullable) to record when payment was released
+  Adds escrow fields, provider wallet balances,
+  and secure referral-code generation.
 
-2. Changes to profiles table
-- Add `wallet_balance` column (numeric, default 0) to track provider earnings held in escrow
-- Add `auto_generate_referral` trigger to ensure every new profile gets a unique referral code
-
-3. New function: generate_unique_referral_code()
-- Generates a unique 8-char alphanumeric referral code from user's name + random suffix
-- Called by trigger on profiles INSERT if referral_code is null
-
-4. New trigger: set_referral_code_on_insert
-- Fires AFTER INSERT on profiles
-- If referral_code is null or empty, generates a unique one and updates the row
-
-5. Security
-- No new tables, only columns added to existing tables
-- Existing RLS policies on service_bookings and profiles remain unchanged
-- The generate_unique_referral_code function is SECURITY DEFINER (needs to read profiles to check uniqueness)
+  Escrow release/refund functions lock booking rows and
+  restrict execution to trusted backend operations.
 */
 
--- Add escrow columns to service_bookings
-ALTER TABLE service_bookings
-  ADD COLUMN IF NOT EXISTS escrow_status text DEFAULT 'none',
+-- =====================================================
+-- 1. ADD ESCROW COLUMNS
+-- =====================================================
+
+ALTER TABLE public.service_bookings
+  ADD COLUMN IF NOT EXISTS escrow_status text NOT NULL DEFAULT 'none',
   ADD COLUMN IF NOT EXISTS escrow_released_at timestamptz;
 
--- Add wallet_balance to profiles
-ALTER TABLE profiles
-  ADD COLUMN IF NOT EXISTS wallet_balance numeric DEFAULT 0;
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'service_bookings_escrow_status_check'
+      AND conrelid = 'public.service_bookings'::regclass
+  ) THEN
+    ALTER TABLE public.service_bookings
+      ADD CONSTRAINT service_bookings_escrow_status_check
+      CHECK (
+        escrow_status IN ('none', 'held', 'released', 'refunded')
+      );
+  END IF;
+END
+$$;
 
--- Function to generate a unique referral code
-CREATE OR REPLACE FUNCTION generate_unique_referral_code(p_name text DEFAULT '')
+
+-- =====================================================
+-- 2. ADD PROVIDER WALLET BALANCE
+-- =====================================================
+
+ALTER TABLE public.profiles
+  ADD COLUMN IF NOT EXISTS wallet_balance numeric(12,2)
+  NOT NULL DEFAULT 0;
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'profiles_wallet_balance_nonnegative'
+      AND conrelid = 'public.profiles'::regclass
+  ) THEN
+    ALTER TABLE public.profiles
+      ADD CONSTRAINT profiles_wallet_balance_nonnegative
+      CHECK (wallet_balance >= 0);
+  END IF;
+END
+$$;
+
+
+-- =====================================================
+-- 3. GENERATE UNIQUE REFERRAL CODES
+-- =====================================================
+
+CREATE OR REPLACE FUNCTION public.generate_unique_referral_code(
+  p_name text DEFAULT ''
+)
 RETURNS text
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = ''
 AS $$
 DECLARE
   v_base text;
   v_code text;
-  v_attempts int := 0;
 BEGIN
-  -- Create base from name: first 3 letters + random
-  v_base := upper(regexp_replace(COALESCE(p_name, ''), '[^a-zA-Z]', '', 'g'));
+  v_base := upper(
+    regexp_replace(
+      coalesce(p_name, ''),
+      '[^a-zA-Z]',
+      '',
+      'g'
+    )
+  );
+
   IF length(v_base) < 2 THEN
     v_base := 'EH';
   END IF;
-  v_base := substring(v_base from 1 for 3);
+
+  v_base := substring(v_base FROM 1 FOR 3);
 
   LOOP
-    v_code := v_base || lpad(floor(random() * 100000)::text, 5, '0');
-    v_attempts := v_attempts + 1;
+    v_code := v_base || upper(
+      substring(
+        replace(gen_random_uuid()::text, '-', '')
+        FROM 1 FOR 8
+      )
+    );
 
-    -- Check uniqueness
-    PERFORM 1 FROM profiles WHERE referral_code = v_code LIMIT 1;
-    IF NOT FOUND THEN
+    IF NOT EXISTS (
+      SELECT 1
+      FROM public.profiles
+      WHERE referral_code = v_code
+    ) THEN
       RETURN v_code;
-    END IF;
-
-    IF v_attempts > 50 THEN
-      -- Fallback: use gen_random_uuid prefix
-      RETURN v_base || upper(substring(gen_random_uuid()::text from 1 for 5));
     END IF;
   END LOOP;
 END;
 $$;
 
--- Function to set referral code on insert if missing
-CREATE OR REPLACE FUNCTION set_referral_code_on_insert()
+
+-- =====================================================
+-- 4. SET REFERRAL CODE BEFORE PROFILE INSERT
+-- =====================================================
+
+CREATE OR REPLACE FUNCTION public.set_referral_code_on_insert()
 RETURNS trigger
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = ''
 AS $$
 BEGIN
-  IF NEW.referral_code IS NULL OR NEW.referral_code = '' THEN
-    NEW.referral_code := generate_unique_referral_code(NEW.full_name);
+  IF NEW.referral_code IS NULL
+     OR btrim(NEW.referral_code) = '' THEN
+    NEW.referral_code :=
+      public.generate_unique_referral_code(NEW.full_name);
   END IF;
+
   RETURN NEW;
 END;
 $$;
 
--- Drop existing trigger if any, then create
-DROP TRIGGER IF EXISTS trg_set_referral_code ON profiles;
+
+DROP TRIGGER IF EXISTS trg_set_referral_code
+ON public.profiles;
+
 CREATE TRIGGER trg_set_referral_code
-  BEFORE INSERT ON profiles
-  FOR EACH ROW
-  EXECUTE FUNCTION set_referral_code_on_insert();
+BEFORE INSERT ON public.profiles
+FOR EACH ROW
+EXECUTE FUNCTION public.set_referral_code_on_insert();
 
--- Backfill any existing profiles with null/empty referral codes
-UPDATE profiles
-SET referral_code = generate_unique_referral_code(full_name)
-WHERE referral_code IS NULL OR referral_code = '';
 
--- Function to release escrow payment when booking is marked completed
--- Called from the app when provider marks booking as completed
-CREATE OR REPLACE FUNCTION release_escrow_payment(p_booking_id uuid)
+-- Backfill profiles without referral codes.
+UPDATE public.profiles
+SET referral_code =
+  public.generate_unique_referral_code(full_name)
+WHERE referral_code IS NULL
+   OR btrim(referral_code) = '';
+
+
+-- =====================================================
+-- 5. RELEASE ESCROW
+-- =====================================================
+
+CREATE OR REPLACE FUNCTION public.release_escrow_payment(
+  p_booking_id uuid
+)
 RETURNS boolean
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = ''
 AS $$
 DECLARE
-  v_booking record;
+  v_booking public.service_bookings%ROWTYPE;
 BEGIN
-  SELECT * INTO v_booking FROM service_bookings WHERE id = p_booking_id;
+  SELECT *
+  INTO v_booking
+  FROM public.service_bookings
+  WHERE id = p_booking_id
+  FOR UPDATE;
 
   IF NOT FOUND THEN
     RETURN false;
   END IF;
 
-  IF v_booking.escrow_status != 'held' THEN
+  IF v_booking.escrow_status <> 'held' THEN
     RETURN false;
   END IF;
 
-  -- Update booking escrow status
-  UPDATE service_bookings
+  IF v_booking.provider_id IS NULL
+     OR v_booking.total_price IS NULL
+     OR v_booking.total_price <= 0 THEN
+    RETURN false;
+  END IF;
+
+  UPDATE public.service_bookings
   SET escrow_status = 'released',
       escrow_released_at = now()
   WHERE id = p_booking_id;
 
-  -- Add to provider's wallet balance
-  UPDATE profiles
+  UPDATE public.profiles
   SET wallet_balance = wallet_balance + v_booking.total_price
   WHERE id = v_booking.provider_id;
+
+  IF NOT FOUND THEN
+    RAISE EXCEPTION 'Provider profile not found';
+  END IF;
 
   RETURN true;
 END;
 $$;
 
--- Function to refund escrow payment when booking is cancelled
-CREATE OR REPLACE FUNCTION refund_escrow_payment(p_booking_id uuid)
+
+-- =====================================================
+-- 6. REFUND ESCROW
+-- =====================================================
+
+CREATE OR REPLACE FUNCTION public.refund_escrow_payment(
+  p_booking_id uuid
+)
 RETURNS boolean
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = ''
 AS $$
 DECLARE
-  v_booking record;
+  v_booking public.service_bookings%ROWTYPE;
 BEGIN
-  SELECT * INTO v_booking FROM service_bookings WHERE id = p_booking_id;
+  SELECT *
+  INTO v_booking
+  FROM public.service_bookings
+  WHERE id = p_booking_id
+  FOR UPDATE;
 
   IF NOT FOUND THEN
     RETURN false;
   END IF;
 
-  IF v_booking.escrow_status != 'held' THEN
+  IF v_booking.escrow_status <> 'held' THEN
     RETURN false;
   END IF;
 
-  -- Update booking escrow status to refunded
-  UPDATE service_bookings
+  UPDATE public.service_bookings
   SET escrow_status = 'refunded'
   WHERE id = p_booking_id;
 
   RETURN true;
 END;
 $$;
+
+
+-- =====================================================
+-- 7. RESTRICT FUNCTION EXECUTION
+-- =====================================================
+
+REVOKE ALL
+ON FUNCTION public.generate_unique_referral_code(text)
+FROM PUBLIC, anon, authenticated;
+
+REVOKE ALL
+ON FUNCTION public.set_referral_code_on_insert()
+FROM PUBLIC, anon, authenticated;
+
+REVOKE ALL
+ON FUNCTION public.release_escrow_payment(uuid)
+FROM PUBLIC, anon, authenticated;
+
+REVOKE ALL
+ON FUNCTION public.refund_escrow_payment(uuid)
+FROM PUBLIC, anon, authenticated;
+
+GRANT EXECUTE
+ON FUNCTION public.generate_unique_referral_code(text)
+TO service_role;
+
+GRANT EXECUTE
+ON FUNCTION public.release_escrow_payment(uuid)
+TO service_role;
+
+GRANT EXECUTE
+ON FUNCTION public.refund_escrow_payment(uuid)
+TO service_role;

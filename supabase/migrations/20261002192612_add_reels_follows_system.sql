@@ -134,15 +134,41 @@ INSERT INTO storage.buckets (id, name, public) VALUES ('reels', 'reels', true)
 ON CONFLICT (id) DO NOTHING;
 
 -- Storage policies for reels bucket
+
+-- Allow authenticated users to view reels in the bucket
 DROP POLICY IF EXISTS "reels_bucket_read" ON storage.objects;
-CREATE POLICY "reels_bucket_read" ON storage.objects FOR SELECT TO authenticated USING (bucket_id = 'reels');
 
+CREATE POLICY "reels_bucket_read"
+ON storage.objects
+FOR SELECT
+TO authenticated
+USING (bucket_id = 'reels');
+
+
+-- Allow authenticated users to upload reels into their own folder
 DROP POLICY IF EXISTS "reels_bucket_upload" ON storage.objects;
-CREATE POLICY "reels_bucket_upload" ON storage.objects FOR INSERT TO authenticated WITH CHECK (bucket_id = 'reels');
 
+CREATE POLICY "reels_bucket_upload"
+ON storage.objects
+FOR INSERT
+TO authenticated
+WITH CHECK (
+  bucket_id = 'reels'
+  AND (storage.foldername(name))[1] = auth.uid()::text
+);
+
+
+-- Allow users to delete only their own uploaded reels
 DROP POLICY IF EXISTS "reels_bucket_delete" ON storage.objects;
-CREATE POLICY "reels_bucket_delete" ON storage.objects FOR DELETE TO authenticated USING (bucket_id = 'reels');
 
+CREATE POLICY "reels_bucket_delete"
+ON storage.objects
+FOR DELETE
+TO authenticated
+USING (
+  bucket_id = 'reels'
+  AND (storage.foldername(name))[1] = auth.uid()::text
+);
 -- Indexes for performance
 CREATE INDEX IF NOT EXISTS idx_reels_created_at ON reels (created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_reel_likes_reel_id ON reel_likes (reel_id);

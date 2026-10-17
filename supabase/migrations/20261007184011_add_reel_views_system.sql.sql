@@ -1,58 +1,128 @@
 /*
-# Add Reel Views System
+  EventHub reel views system.
 
-1. New Tables
-- `reel_views` — tracks which users have viewed which reels (for per-user deduplication)
-  - `id` (uuid, primary key)
-  - `reel_id` (uuid, foreign key to reels, not null)
-  - `user_id` (uuid, foreign key to auth.users, not null)
-  - `created_at` (timestamptz, default now())
-  - Unique constraint on (reel_id, user_id) to prevent duplicate views
-
-2. Modified Tables
-- `reels` — added `view_count` column (integer, default 0) to track total views
-
-3. Security
-- Enable RLS on `reel_views`
-- SELECT: users can see view records (needed for dedup checks)
-- INSERT: authenticated users can insert their own view record
-- The unique constraint ensures one view per user per reel
+  - Tracks authenticated users' reel views.
+  - Allows one view record per user per reel.
+  - Maintains a durable view counter.
+  - Prevents users from directly updating arbitrary reel fields.
 */
 
-DO $$ BEGIN
-  IF NOT EXISTS (
-    SELECT 1 FROM information_schema.columns
-    WHERE table_name = 'reels' AND column_name = 'view_count'
-  ) THEN
-    ALTER TABLE reels ADD COLUMN view_count integer NOT NULL DEFAULT 0;
-  END IF;
-END $$;
+-- =====================================================
+-- 1. ADD VIEW COUNTER
+-- =====================================================
 
-CREATE TABLE IF NOT EXISTS reel_views (
+ALTER TABLE public.reels
+  ADD COLUMN IF NOT EXISTS view_count integer NOT NULL DEFAULT 0;
+
+-- Prevent negative view counts.
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'reels_view_count_nonnegative'
+      AND conrelid = 'public.reels'::regclass
+  ) THEN
+    ALTER TABLE public.reels
+      ADD CONSTRAINT reels_view_count_nonnegative
+      CHECK (view_count >= 0);
+  END IF;
+END
+$$;
+
+
+-- =====================================================
+-- 2. CREATE REEL VIEWS TABLE
+-- =====================================================
+
+CREATE TABLE IF NOT EXISTS public.reel_views (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  reel_id uuid NOT NULL REFERENCES reels(id) ON DELETE CASCADE,
-  user_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-  created_at timestamptz DEFAULT now(),
-  UNIQUE(reel_id, user_id)
+
+  reel_id uuid NOT NULL
+    REFERENCES public.reels(id) ON DELETE CASCADE,
+
+  user_id uuid NOT NULL
+    REFERENCES auth.users(id) ON DELETE CASCADE,
+
+  created_at timestamptz NOT NULL DEFAULT now(),
+
+  CONSTRAINT reel_views_one_per_user
+    UNIQUE (reel_id, user_id)
 );
 
-ALTER TABLE reel_views ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.reel_views
+  ENABLE ROW LEVEL SECURITY;
 
-DROP POLICY IF EXISTS "select_reel_views" ON reel_views;
+
+-- =====================================================
+-- 3. VIEW POLICIES
+-- =====================================================
+
+DROP POLICY IF EXISTS "select_reel_views"
+ON public.reel_views;
+
 CREATE POLICY "select_reel_views"
-ON reel_views FOR SELECT
+ON public.reel_views
+FOR SELECT
 TO authenticated
 USING (true);
 
-DROP POLICY IF EXISTS "insert_own_reel_view" ON reel_views;
+
+DROP POLICY IF EXISTS "insert_own_reel_view"
+ON public.reel_views;
+
 CREATE POLICY "insert_own_reel_view"
-ON reel_views FOR INSERT
+ON public.reel_views
+FOR INSERT
 TO authenticated
 WITH CHECK (auth.uid() = user_id);
 
-DROP POLICY IF EXISTS "update_own_reels_view_count" ON reels;
-CREATE POLICY "update_own_reels_view_count"
-ON reels FOR UPDATE
-TO authenticated
-USING (true)
-WITH CHECK (true);
+
+-- =====================================================
+-- 4. INDEX
+-- =====================================================
+
+CREATE INDEX IF NOT EXISTS idx_reel_views_reel_id
+ON public.reel_views(reel_id);
+
+
+-- =====================================================
+-- 5. REMOVE UNSAFE REEL UPDATE POLICY
+-- =====================================================
+
+DROP POLICY IF EXISTS "update_own_reels_view_count"
+ON public.reels;
+
+
+-- =====================================================
+-- 6. DURABLE VIEW COUNTER TRIGGER
+-- =====================================================
+
+CREATE OR REPLACE FUNCTION public.increment_reel_view_count()
+RETURNS trigger
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+BEGIN
+  UPDATE public.reels
+  SET view_count = view_count + 1
+  WHERE id = NEW.reel_id;
+
+  RETURN NEW;
+END;
+$$;
+
+
+REVOKE ALL
+ON FUNCTION public.increment_reel_view_count()
+FROM PUBLIC, anon, authenticated;
+
+
+DROP TRIGGER IF EXISTS trg_increment_reel_view_count
+ON public.reel_views;
+
+CREATE TRIGGER trg_increment_reel_view_count
+AFTER INSERT ON public.reel_views
+FOR EACH ROW
+EXECUTE FUNCTION public.increment_reel_view_count();

@@ -308,21 +308,39 @@ export default function AuthPage() {
   };
 
   const handleForgotReset = async (e: React.FormEvent) => {
-    e.preventDefault();
-    setResetError('');
-    if (!forgotEmail.trim()) { setResetError('Please enter your email'); return; }
-    const pwCheck = validatePassword(newPassword);
-    if (!pwCheck.valid) { setResetError(pwCheck.message); return; }
-    if (newPassword !== confirmPassword) { setResetError('Passwords do not match'); return; }
-    setResetLoading(true);
-    const { data, error: fnError } = await supabase.functions.invoke('reset-password', {
-      body: JSON.stringify({ email: forgotEmail.trim(), newPassword }),
-    });
-    setResetLoading(false);
-    if (fnError) { setResetError(fnError.message); return; }
-    if (data?.error) { setResetError(data.error); return; }
+  e.preventDefault();
+  setResetError('');
+
+  if (!forgotEmail.trim()) {
+    setResetError('Please enter your email');
+    return;
+  }
+
+  setResetLoading(true);
+
+  try {
+    const { error: recoveryError } =
+      await supabase.auth.resetPasswordForEmail(
+        forgotEmail.trim(),
+        {
+          redirectTo: `${window.location.origin}/auth`,
+        }
+      );
+
+    if (recoveryError) {
+      setResetError(
+        'Unable to send the recovery email. Please try again.'
+      );
+      return;
+    }
+
     setResetSuccess(true);
-  };
+  } catch {
+    setResetError('Something went wrong. Please try again.');
+  } finally {
+    setResetLoading(false);
+  }
+};
 
   const handleUpdatePassword = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -369,8 +387,13 @@ export default function AuthPage() {
                     <Check className="w-8 h-8 text-green-500" />
                   </div>
                   <div>
-                    <p className="font-semibold text-gray-900 mb-1">Password updated!</p>
-                    <p className="text-sm text-gray-500">Your password has been changed successfully. Please sign in with your new password.</p>
+                    <p className="font-semibold text-gray-900 mb-1">
+  Check your email
+</p>
+                    <p className="text-sm text-gray-500">
+  If an account exists for this email, you will receive a password
+  recovery link. Open that email to continue resetting your password.
+</p>
                   </div>
                   <button
                     onClick={() => {

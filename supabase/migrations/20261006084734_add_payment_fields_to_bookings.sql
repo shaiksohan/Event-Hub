@@ -1,60 +1,129 @@
 /*
-# Add Payment Fields to Service Bookings
-
-## Summary
-Adds support for UPI-based payments (PhonePe, Paytm, GPay) to the booking flow.
-Customers can select a payment method, upload a payment screenshot, and the
-booking is confirmed after payment. Transaction details are visible in the profile.
-
-## Changes to `service_bookings`
-- `address` (text, nullable) — event/service address provided by the customer at booking time
-- `payment_method` (text, nullable) — which UPI app was used: 'phonepe', 'paytm', 'gpay', or null
-- `payment_screenshot_url` (text, nullable) — public URL of uploaded payment screenshot in storage
-- `payment_status` (text, not null, default 'pending') — 'pending', 'paid', 'failed'
-
-## New Storage Bucket
-- `payment-screenshots` — public bucket for storing payment screenshot images
-- Policies: authenticated users can upload and read; only owner can update/delete their own screenshots
-
-## Security
-- RLS enabled on `payment-screenshots` bucket
-- Booking RLS policies updated to allow owner (customer) and provider to read payment info
+  Add payment fields to service bookings and create
+  private storage for payment screenshots.
 */
 
--- Add new columns to service_bookings
-ALTER TABLE service_bookings
+-- =====================================================
+-- 1. ADD PAYMENT FIELDS
+-- =====================================================
+
+ALTER TABLE public.service_bookings
   ADD COLUMN IF NOT EXISTS address text,
   ADD COLUMN IF NOT EXISTS payment_method text,
   ADD COLUMN IF NOT EXISTS payment_screenshot_url text,
   ADD COLUMN IF NOT EXISTS payment_status text NOT NULL DEFAULT 'pending';
 
--- Create payment screenshots storage bucket
+
+-- =====================================================
+-- 2. VALIDATE PAYMENT STATUS AND METHOD
+-- =====================================================
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'service_bookings_payment_status_check'
+      AND conrelid = 'public.service_bookings'::regclass
+  ) THEN
+    ALTER TABLE public.service_bookings
+      ADD CONSTRAINT service_bookings_payment_status_check
+      CHECK (payment_status IN ('pending', 'paid', 'failed'));
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_constraint
+    WHERE conname = 'service_bookings_payment_method_check'
+      AND conrelid = 'public.service_bookings'::regclass
+  ) THEN
+    ALTER TABLE public.service_bookings
+      ADD CONSTRAINT service_bookings_payment_method_check
+      CHECK (
+        payment_method IS NULL
+        OR payment_method IN ('phonepe', 'paytm', 'gpay')
+      );
+  END IF;
+END
+$$;
+
+
+-- =====================================================
+-- 3. CREATE PRIVATE PAYMENT SCREENSHOT BUCKET
+-- =====================================================
+
 INSERT INTO storage.buckets (id, name, public)
-VALUES ('payment-screenshots', 'payment-screenshots', true)
-ON CONFLICT (id) DO NOTHING;
+VALUES ('payment-screenshots', 'payment-screenshots', false)
+ON CONFLICT (id) DO UPDATE SET public = false;
 
--- Storage policies for payment-screenshots bucket
-DROP POLICY IF EXISTS "Auth users can upload payment screenshots" ON storage.objects;
+
+-- =====================================================
+-- 4. RESTRICT UPLOADS TO THE USER'S OWN FOLDER
+-- =====================================================
+
+DROP POLICY IF EXISTS "Auth users can upload payment screenshots"
+ON storage.objects;
+
 CREATE POLICY "Auth users can upload payment screenshots"
-ON storage.objects FOR INSERT
+ON storage.objects
+FOR INSERT
 TO authenticated
-WITH CHECK (bucket_id = 'payment-screenshots');
+WITH CHECK (
+  bucket_id = 'payment-screenshots'
+  AND (storage.foldername(name))[1] = auth.uid()::text
+);
 
-DROP POLICY IF EXISTS "Anyone can read payment screenshots" ON storage.objects;
-CREATE POLICY "Anyone can read payment screenshots"
-ON storage.objects FOR SELECT
-TO public
-USING (bucket_id = 'payment-screenshots');
 
-DROP POLICY IF EXISTS "Owner can update payment screenshots" ON storage.objects;
+-- =====================================================
+-- 5. RESTRICT READ ACCESS TO THE FILE OWNER
+-- =====================================================
+
+DROP POLICY IF EXISTS "Anyone can read payment screenshots"
+ON storage.objects;
+
+CREATE POLICY "Owners can read payment screenshots"
+ON storage.objects
+FOR SELECT
+TO authenticated
+USING (
+  bucket_id = 'payment-screenshots'
+  AND (storage.foldername(name))[1] = auth.uid()::text
+);
+
+
+-- =====================================================
+-- 6. RESTRICT UPDATES TO THE FILE OWNER
+-- =====================================================
+
+DROP POLICY IF EXISTS "Owner can update payment screenshots"
+ON storage.objects;
+
 CREATE POLICY "Owner can update payment screenshots"
-ON storage.objects FOR UPDATE
+ON storage.objects
+FOR UPDATE
 TO authenticated
-USING (bucket_id = 'payment-screenshots' AND owner = auth.uid())
-WITH CHECK (bucket_id = 'payment-screenshots');
+USING (
+  bucket_id = 'payment-screenshots'
+  AND (storage.foldername(name))[1] = auth.uid()::text
+)
+WITH CHECK (
+  bucket_id = 'payment-screenshots'
+  AND (storage.foldername(name))[1] = auth.uid()::text
+);
 
-DROP POLICY IF EXISTS "Owner can delete payment screenshots" ON storage.objects;
+
+-- =====================================================
+-- 7. RESTRICT DELETIONS TO THE FILE OWNER
+-- =====================================================
+
+DROP POLICY IF EXISTS "Owner can delete payment screenshots"
+ON storage.objects;
+
 CREATE POLICY "Owner can delete payment screenshots"
-ON storage.objects FOR DELETE
+ON storage.objects
+FOR DELETE
 TO authenticated
-USING (bucket_id = 'payment-screenshots' AND owner = auth.uid());
+USING (
+  bucket_id = 'payment-screenshots'
+  AND (storage.foldername(name))[1] = auth.uid()::text
+);

@@ -1,25 +1,46 @@
 /*
-# Make Reel View Counting Durable
+  Make reel view counting durable.
 
-1. Database Function
-- `record_reel_view` records one authenticated user's view for a reel.
-- Duplicate views from the same user are ignored.
-- A new unique view increments `reels.view_count` atomically.
-
-2. Security
-- The function runs with a fixed `public` search path.
-- The acting user is taken from `auth.uid()` rather than from a caller-controlled value.
-- Only authenticated users may call the function.
-- The broad client update policy for `reels` is removed; browsers can no longer edit reel counters directly.
+  - Records one view per authenticated user and reel.
+  - Ignores duplicate views.
+  - Increments the counter only for a newly inserted view.
+  - Prevents direct client updates to reel counters.
 */
 
-DROP POLICY IF EXISTS "update_own_reels_view_count" ON reels;
+-- =====================================================
+-- 1. REMOVE THE BROAD UPDATE POLICY
+-- =====================================================
 
-CREATE OR REPLACE FUNCTION public.record_reel_view(p_reel_id uuid)
+DROP POLICY IF EXISTS "update_own_reels_view_count"
+ON public.reels;
+
+
+-- =====================================================
+-- 2. REMOVE THE PREVIOUS COUNTER TRIGGER
+-- =====================================================
+
+DROP TRIGGER IF EXISTS trg_increment_reel_view_count
+ON public.reel_views;
+
+
+-- =====================================================
+-- 3. REMOVE THE TRIGGER FUNCTION
+-- =====================================================
+
+DROP FUNCTION IF EXISTS public.increment_reel_view_count();
+
+
+-- =====================================================
+-- 4. CREATE THE VIEW RECORDING FUNCTION
+-- =====================================================
+
+CREATE OR REPLACE FUNCTION public.record_reel_view(
+  p_reel_id uuid
+)
 RETURNS void
 LANGUAGE plpgsql
 SECURITY DEFINER
-SET search_path = public
+SET search_path = ''
 AS $$
 DECLARE
   inserted_count integer;
@@ -28,8 +49,14 @@ BEGIN
     RAISE EXCEPTION 'Authentication required';
   END IF;
 
-  INSERT INTO public.reel_views (reel_id, user_id)
-  VALUES (p_reel_id, auth.uid())
+  INSERT INTO public.reel_views (
+    reel_id,
+    user_id
+  )
+  VALUES (
+    p_reel_id,
+    auth.uid()
+  )
   ON CONFLICT (reel_id, user_id) DO NOTHING;
 
   GET DIAGNOSTICS inserted_count = ROW_COUNT;
@@ -42,6 +69,15 @@ BEGIN
 END;
 $$;
 
-REVOKE EXECUTE ON FUNCTION public.record_reel_view(uuid) FROM PUBLIC;
-REVOKE EXECUTE ON FUNCTION public.record_reel_view(uuid) FROM anon;
-GRANT EXECUTE ON FUNCTION public.record_reel_view(uuid) TO authenticated;
+
+-- =====================================================
+-- 5. RESTRICT FUNCTION EXECUTION
+-- =====================================================
+
+REVOKE ALL
+ON FUNCTION public.record_reel_view(uuid)
+FROM PUBLIC, anon;
+
+GRANT EXECUTE
+ON FUNCTION public.record_reel_view(uuid)
+TO authenticated;

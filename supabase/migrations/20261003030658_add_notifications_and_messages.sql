@@ -1,40 +1,20 @@
 /*
-# Add notifications, messages tables and review insert support
+  EventHub notifications and direct messages.
 
-1. New Tables
-- `notifications` — stores notifications for each user (new follows, likes, comments, bookings, messages).
-  - id (uuid PK)
-  - user_id (uuid, recipient of notification, FK -> auth.users)
-  - actor_id (uuid, who triggered the notification, FK -> auth.users)
-  - type (text: 'follow' | 'like' | 'comment' | 'booking' | 'message')
-  - entity_id (uuid, optional reference to related entity)
-  - entity_type (text, optional: 'reel' | 'service' | 'booking')
-  - message (text, human-readable notification text)
-  - read (boolean, default false)
-  - created_at (timestamptz)
-
-- `messages` — direct messages between two users.
-  - id (uuid PK)
-  - sender_id (uuid, FK -> auth.users)
-  - receiver_id (uuid, FK -> auth.users)
-  - content (text, message body)
-  - read (boolean, default false)
-  - created_at (timestamptz)
-
-2. Security
-- Enable RLS on both tables.
-- notifications: owner can SELECT, UPDATE (mark read), and INSERT is allowed for any authenticated user (since notifications are created by actions from other users).
-- messages: sender or receiver can SELECT; only sender can INSERT; sender or receiver can UPDATE (mark read); sender or receiver can DELETE.
-
-3. Indexes
-- notifications: user_id + created_at
-- messages: receiver_id + created_at, sender_id + created_at
-
-4. Realtime
-- Add notifications and messages to supabase_realtime publication.
+  Security:
+  - Users can read their own notifications.
+  - Authenticated users can create notifications as themselves.
+  - Users can update their own notifications.
+  - Only message participants can read messages.
+  - Only the sender can create messages.
+  - Message participants can update messages and delete messages.
 */
 
-CREATE TABLE IF NOT EXISTS notifications (
+-- =====================================================
+-- 1. NOTIFICATIONS
+-- =====================================================
+
+CREATE TABLE IF NOT EXISTS public.notifications (
   id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
   user_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
   actor_id uuid REFERENCES auth.users(id) ON DELETE SET NULL,
@@ -46,60 +26,164 @@ CREATE TABLE IF NOT EXISTS notifications (
   created_at timestamptz NOT NULL DEFAULT now()
 );
 
-ALTER TABLE notifications ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.notifications ENABLE ROW LEVEL SECURITY;
 
-DROP POLICY IF EXISTS "select_own_notifications" ON notifications;
-CREATE POLICY "select_own_notifications" ON notifications
-  FOR SELECT TO authenticated
-  USING (auth.uid() = user_id);
+DROP POLICY IF EXISTS "select_own_notifications"
+ON public.notifications;
 
-DROP POLICY IF EXISTS "insert_notifications" ON notifications;
-CREATE POLICY "insert_notifications" ON notifications
-  FOR INSERT TO authenticated
-  WITH CHECK (auth.uid() = actor_id);
+CREATE POLICY "select_own_notifications"
+ON public.notifications
+FOR SELECT
+TO authenticated
+USING (auth.uid() = user_id);
 
-DROP POLICY IF EXISTS "update_own_notifications" ON notifications;
-CREATE POLICY "update_own_notifications" ON notifications
-  FOR UPDATE TO authenticated
-  USING (auth.uid() = user_id)
-  WITH CHECK (auth.uid() = user_id);
 
-CREATE INDEX IF NOT EXISTS idx_notifications_user_created ON notifications(user_id, created_at DESC);
+DROP POLICY IF EXISTS "insert_notifications"
+ON public.notifications;
 
-CREATE TABLE IF NOT EXISTS messages (
-  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
-  sender_id uuid NOT NULL DEFAULT auth.uid() REFERENCES auth.users(id) ON DELETE CASCADE,
-  receiver_id uuid NOT NULL REFERENCES auth.users(id) ON DELETE CASCADE,
-  content text NOT NULL,
-  read boolean NOT NULL DEFAULT false,
-  created_at timestamptz NOT NULL DEFAULT now()
+CREATE POLICY "insert_notifications"
+ON public.notifications
+FOR INSERT
+TO authenticated
+WITH CHECK (
+  auth.uid() = actor_id
+  AND user_id <> auth.uid()
+  AND type IN ('follow', 'like', 'comment', 'booking', 'message')
+  AND (
+    entity_type IS NULL
+    OR entity_type IN ('reel', 'service', 'booking')
+  )
 );
 
-ALTER TABLE messages ENABLE ROW LEVEL SECURITY;
 
-DROP POLICY IF EXISTS "select_own_messages" ON messages;
-CREATE POLICY "select_own_messages" ON messages
-  FOR SELECT TO authenticated
-  USING (auth.uid() = sender_id OR auth.uid() = receiver_id);
+DROP POLICY IF EXISTS "update_own_notifications"
+ON public.notifications;
 
-DROP POLICY IF EXISTS "insert_own_messages" ON messages;
-CREATE POLICY "insert_own_messages" ON messages
-  FOR INSERT TO authenticated
-  WITH CHECK (auth.uid() = sender_id);
+CREATE POLICY "update_own_notifications"
+ON public.notifications
+FOR UPDATE
+TO authenticated
+USING (auth.uid() = user_id)
+WITH CHECK (auth.uid() = user_id);
 
-DROP POLICY IF EXISTS "update_own_messages" ON messages;
-CREATE POLICY "update_own_messages" ON messages
-  FOR UPDATE TO authenticated
-  USING (auth.uid() = sender_id OR auth.uid() = receiver_id)
-  WITH CHECK (auth.uid() = sender_id OR auth.uid() = receiver_id);
 
-DROP POLICY IF EXISTS "delete_own_messages" ON messages;
-CREATE POLICY "delete_own_messages" ON messages
-  FOR DELETE TO authenticated
-  USING (auth.uid() = sender_id OR auth.uid() = receiver_id);
+CREATE INDEX IF NOT EXISTS idx_notifications_user_created
+ON public.notifications(user_id, created_at DESC);
 
-CREATE INDEX IF NOT EXISTS idx_messages_receiver_created ON messages(receiver_id, created_at DESC);
-CREATE INDEX IF NOT EXISTS idx_messages_sender_created ON messages(sender_id, created_at DESC);
 
-ALTER PUBLICATION supabase_realtime ADD TABLE notifications;
-ALTER PUBLICATION supabase_realtime ADD TABLE messages;
+-- =====================================================
+-- 2. MESSAGES
+-- =====================================================
+
+CREATE TABLE IF NOT EXISTS public.messages (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  sender_id uuid NOT NULL DEFAULT auth.uid()
+    REFERENCES auth.users(id) ON DELETE CASCADE,
+  receiver_id uuid NOT NULL
+    REFERENCES auth.users(id) ON DELETE CASCADE,
+  content text NOT NULL,
+  read boolean NOT NULL DEFAULT false,
+  created_at timestamptz NOT NULL DEFAULT now(),
+
+  CONSTRAINT messages_no_self_message
+    CHECK (sender_id <> receiver_id),
+
+  CONSTRAINT messages_content_not_empty
+    CHECK (length(trim(content)) > 0)
+);
+
+ALTER TABLE public.messages ENABLE ROW LEVEL SECURITY;
+
+
+DROP POLICY IF EXISTS "select_own_messages"
+ON public.messages;
+
+CREATE POLICY "select_own_messages"
+ON public.messages
+FOR SELECT
+TO authenticated
+USING (
+  auth.uid() = sender_id
+  OR auth.uid() = receiver_id
+);
+
+
+DROP POLICY IF EXISTS "insert_own_messages"
+ON public.messages;
+
+CREATE POLICY "insert_own_messages"
+ON public.messages
+FOR INSERT
+TO authenticated
+WITH CHECK (
+  auth.uid() = sender_id
+  AND auth.uid() <> receiver_id
+);
+
+
+DROP POLICY IF EXISTS "update_own_messages"
+ON public.messages;
+
+CREATE POLICY "update_own_messages"
+ON public.messages
+FOR UPDATE
+TO authenticated
+USING (
+  auth.uid() = sender_id
+  OR auth.uid() = receiver_id
+)
+WITH CHECK (
+  auth.uid() = sender_id
+  OR auth.uid() = receiver_id
+);
+
+
+DROP POLICY IF EXISTS "delete_own_messages"
+ON public.messages;
+
+CREATE POLICY "delete_own_messages"
+ON public.messages
+FOR DELETE
+TO authenticated
+USING (
+  auth.uid() = sender_id
+  OR auth.uid() = receiver_id
+);
+
+
+CREATE INDEX IF NOT EXISTS idx_messages_receiver_created
+ON public.messages(receiver_id, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_messages_sender_created
+ON public.messages(sender_id, created_at DESC);
+
+
+-- =====================================================
+-- 3. ENABLE REALTIME SAFELY
+-- =====================================================
+
+DO $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_publication_tables
+    WHERE pubname = 'supabase_realtime'
+      AND schemaname = 'public'
+      AND tablename = 'notifications'
+  ) THEN
+    ALTER PUBLICATION supabase_realtime
+      ADD TABLE public.notifications;
+  END IF;
+
+  IF NOT EXISTS (
+    SELECT 1
+    FROM pg_publication_tables
+    WHERE pubname = 'supabase_realtime'
+      AND schemaname = 'public'
+      AND tablename = 'messages'
+  ) THEN
+    ALTER PUBLICATION supabase_realtime
+      ADD TABLE public.messages;
+  END IF;
+END
+$$;
